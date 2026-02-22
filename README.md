@@ -14,6 +14,8 @@ pip install yt-dlp
 
 ## Installation
 
+### Imperative (per-user, not tied to a config file)
+
 ```bash
 # Install to your profile
 nix profile install github:rohanp2051/yt2xml
@@ -24,6 +26,30 @@ nix run github:rohanp2051/yt2xml -- "https://youtu.be/dQw4w9WgXcQ"
 # Local build from checkout
 nix build .
 ./result/bin/yt2xml --version
+```
+
+### Declarative (pinned in your system or home-manager flake)
+
+Add yt2xml as a flake input:
+
+```nix
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    yt2xml.url = "github:rohanp2051/yt2xml";
+  };
+}
+```
+
+Then include the package:
+
+```nix
+# NixOS (configuration.nix)
+environment.systemPackages = [ inputs.yt2xml.packages.${system}.default ];
+
+# Or home-manager (home.nix)
+home.packages = [ inputs.yt2xml.packages.${system}.default ];
 ```
 
 ## Usage
@@ -44,6 +70,22 @@ yt2xml [OPTIONS] URL [URL...]
 | `--url` | Include `url` attribute in `<t>` elements |
 | `-h, --help` | Show help message |
 | `--version` | Print version |
+
+### Per-URL Overrides
+
+Append colon-separated flags to any URL to override global settings for that specific video. The `:--` delimiter is used because it never appears in real URLs.
+
+| Per-URL Flag | Description |
+|---|---|
+| `--no-desc` | Omit description for this URL |
+| `--no-channel` | Omit channel for this URL |
+| `--url` | Include URL attribute for this URL |
+| `--desc` | Keep description (override global `--no-desc`) |
+| `--channel` | Keep channel (override global `--no-channel`) |
+| `--no-url` | Hide URL attribute (override global `--url`) |
+| `--lang=CODES` | Override subtitle language for this URL |
+
+Multiple flags are comma-separated: `URL:--no-desc,--no-channel`
 
 ### Examples
 
@@ -68,6 +110,18 @@ yt2xml --url "https://youtu.be/vid1"
 
 # Verbose mode for debugging
 yt2xml -v "https://youtu.be/vid1"
+
+# Per-URL: omit description for first video only
+yt2xml "https://youtu.be/vid1:--no-desc" "https://youtu.be/vid2"
+
+# Global --no-desc, but second video keeps its description
+yt2xml --no-desc "https://youtu.be/vid1" "https://youtu.be/vid2:--desc"
+
+# Different subtitle languages per video
+yt2xml "https://youtu.be/vid1:--lang=es" "https://youtu.be/vid2:--lang=en"
+
+# Multiple per-URL flags
+yt2xml "https://youtu.be/vid1:--no-desc,--no-channel"
 ```
 
 ## Output Format
@@ -110,3 +164,20 @@ Failed videos are included as XML comments:
 4. Wraps everything in compact XML with video metadata as attributes
 
 Duplicate URLs are automatically detected and skipped.
+
+## AI Assistant Integration
+
+yt2xml is designed to pipe video transcripts directly into LLM context windows. The compact XML format minimizes token usage while preserving structure.
+
+```bash
+# Feed a video transcript to an LLM via stdin
+yt2xml "https://youtu.be/dQw4w9WgXcQ" | llm "Summarize this video"
+
+# Save context for a multi-video research session
+yt2xml --no-desc --no-channel \
+  "https://youtu.be/vid1" \
+  "https://youtu.be/vid2:--lang=es" \
+  -o context.xml
+```
+
+Per-URL overrides let you tailor each video's metadata to your prompt needs — keep descriptions for videos you want summarized, omit them for videos you only need transcripts from.

@@ -6,7 +6,7 @@ set -euo pipefail
 ###############################################################################
 
 PROGNAME="yt2xml"
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -32,6 +32,17 @@ Options:
       --no-channel    Omit channel attribute
       --url           Include url attribute in <t> elements
 
+Per-URL overrides:
+  Append colon-separated flags to any URL to override globals for that URL:
+    URL:--FLAG            Single flag override
+    URL:--FLAG1,--FLAG2   Multiple flag overrides
+
+  Override flags (per-URL only):
+    --desc                Override global --no-desc (keep description)
+    --channel             Override global --no-channel (keep channel)
+    --no-url              Override global --url (hide URL)
+    --lang=CODES          Override global --lang for this URL
+
 Arguments:
   URL                 One or more video URLs (any yt-dlp supported site)
 
@@ -39,6 +50,10 @@ Examples:
   yt2xml "https://youtu.be/dQw4w9WgXcQ"
   yt2xml -o context.xml "https://youtu.be/vid1" "https://youtu.be/vid2"
   yt2xml --lang es,en --no-desc "https://youtu.be/vid1"
+  yt2xml "https://youtu.be/vid1:--no-desc" "https://youtu.be/vid2"
+  yt2xml --no-desc "https://youtu.be/vid1" "https://youtu.be/vid2:--desc"
+  yt2xml "https://youtu.be/vid1:--lang=es" "https://youtu.be/vid2:--lang=en"
+  yt2xml "https://youtu.be/vid1:--no-desc,--no-channel"
 EOF
 }
 
@@ -180,6 +195,67 @@ NO_CHANNEL=0
 SHOW_URL=0
 URLS=()
 
+# Per-URL override arrays (parallel to URLS)
+URL_OVR_NO_DESC=()
+URL_OVR_NO_CHANNEL=()
+URL_OVR_SHOW_URL=()
+URL_OVR_LANG=()
+
+# parse_url_overrides ARG
+# Splits ARG on `:--`, extracts URL into _parsed_url and override flags
+# into the URL_OVR_* arrays. Dies on invalid per-URL flags.
+parse_url_overrides() {
+  local arg="$1"
+  local url flags
+
+  # Default: no overrides (empty string means "use global")
+  local ovr_no_desc=""
+  local ovr_no_channel=""
+  local ovr_show_url=""
+  local ovr_lang=""
+
+  if [[ "$arg" == *":--"* ]]; then
+    url="${arg%%:--*}"
+    flags="${arg#*:--}"
+    # flags is e.g. "no-desc,--no-channel" or "lang=es"
+    # Re-add the leading -- stripped by the split
+    flags="--$flags"
+
+    # Split on comma and process each flag
+    local IFS=','
+    for flag in $flags; do
+      case "$flag" in
+        --no-desc)    ovr_no_desc=1 ;;
+        --no-channel) ovr_no_channel=1 ;;
+        --url)        ovr_show_url=1 ;;
+        --desc)       ovr_no_desc=0 ;;
+        --channel)    ovr_no_channel=0 ;;
+        --no-url)     ovr_show_url=0 ;;
+        --lang=*)
+          ovr_lang="${flag#--lang=}"
+          if ! printf '%s' "$ovr_lang" | grep -qE '^[a-zA-Z-]{2,}(,[a-zA-Z-]{2,})*$'; then
+            die "Invalid per-URL --lang format: '$ovr_lang'. Expected comma-separated language codes (e.g., en,es,fr)"
+          fi
+          ;;
+        -o|--output|-v|--verbose)
+          die "Flag $flag cannot be used as a per-URL override"
+          ;;
+        *)
+          die "Unknown per-URL flag: $flag"
+          ;;
+      esac
+    done
+  else
+    url="$arg"
+  fi
+
+  _parsed_url="$url"
+  URL_OVR_NO_DESC+=("$ovr_no_desc")
+  URL_OVR_NO_CHANNEL+=("$ovr_no_channel")
+  URL_OVR_SHOW_URL+=("$ovr_show_url")
+  URL_OVR_LANG+=("$ovr_lang")
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     -o|--output)
@@ -216,11 +292,15 @@ while [ $# -gt 0 ]; do
       SHOW_URL=1
       shift
       ;;
+    --desc|--channel|--no-url)
+      die "Flag $1 is only valid as a per-URL override (e.g., URL:$1)"
+      ;;
     --)
       shift
       # Remaining args are URLs
       while [ $# -gt 0 ]; do
-        URLS+=("$1")
+        parse_url_overrides "$1"
+        URLS+=("$_parsed_url")
         shift
       done
       ;;
@@ -228,7 +308,8 @@ while [ $# -gt 0 ]; do
       die "Unknown option: $1. Use --help for usage."
       ;;
     *)
-      URLS+=("$1")
+      parse_url_overrides "$1"
+      URLS+=("$_parsed_url")
       shift
       ;;
   esac
@@ -256,9 +337,14 @@ check_deps
 # ---------------------------------------------------------------------------
 
 UNIQUE_URLS=()
+UNIQUE_OVR_NO_DESC=()
+UNIQUE_OVR_NO_CHANNEL=()
+UNIQUE_OVR_SHOW_URL=()
+UNIQUE_OVR_LANG=()
 SEEN_URLS=""
 
-for url in "${URLS[@]}"; do
+for _dedup_i in $(seq 0 $((${#URLS[@]} - 1))); do
+  url="${URLS[$_dedup_i]}"
   # Simple dedup check using a delimited string (Bash 3.2 compatible)
   case "$SEEN_URLS" in
     *"|$url|"*)
@@ -267,6 +353,10 @@ for url in "${URLS[@]}"; do
     *)
       SEEN_URLS="${SEEN_URLS}|${url}|"
       UNIQUE_URLS+=("$url")
+      UNIQUE_OVR_NO_DESC+=("${URL_OVR_NO_DESC[$_dedup_i]}")
+      UNIQUE_OVR_NO_CHANNEL+=("${URL_OVR_NO_CHANNEL[$_dedup_i]}")
+      UNIQUE_OVR_SHOW_URL+=("${URL_OVR_SHOW_URL[$_dedup_i]}")
+      UNIQUE_OVR_LANG+=("${URL_OVR_LANG[$_dedup_i]}")
       ;;
   esac
 done
@@ -293,12 +383,21 @@ result_channels=()
 result_descs=()
 result_texts=()
 result_urls=()
+result_eff_no_desc=()
+result_eff_no_channel=()
+result_eff_show_url=()
 fail_urls=()
 fail_reasons=()
 
 for i in $(seq 0 $((total - 1))); do
   url="${UNIQUE_URLS[$i]}"
   idx=$((i + 1))
+
+  # Compute effective flags: per-URL override if set, else global
+  eff_no_desc="${UNIQUE_OVR_NO_DESC[$i]:-$NO_DESC}"
+  eff_no_channel="${UNIQUE_OVR_NO_CHANNEL[$i]:-$NO_CHANNEL}"
+  eff_show_url="${UNIQUE_OVR_SHOW_URL[$i]:-$SHOW_URL}"
+  eff_lang="${UNIQUE_OVR_LANG[$i]:-$LANG_CODES}"
 
   log "[$idx/$total] Fetching $url..."
 
@@ -314,7 +413,7 @@ for i in $(seq 0 $((total - 1))); do
   if [ "$VERBOSE" -eq 1 ]; then
     yt-dlp \
       --write-subs --write-auto-subs \
-      --sub-lang "$LANG_CODES" \
+      --sub-lang "$eff_lang" \
       --sub-format "vtt" \
       --skip-download \
       --no-playlist \
@@ -327,7 +426,7 @@ for i in $(seq 0 $((total - 1))); do
   else
     yt-dlp \
       --write-subs --write-auto-subs \
-      --sub-lang "$LANG_CODES" \
+      --sub-lang "$eff_lang" \
       --sub-format "vtt" \
       --skip-download \
       --no-playlist \
@@ -409,7 +508,7 @@ for i in $(seq 0 $((total - 1))); do
 
   # Read description if available
   video_desc=""
-  if [ "$NO_DESC" -eq 0 ]; then
+  if [ "$eff_no_desc" -eq 0 ]; then
     desc_file=""
     for f in "$tmpdir"/*.description; do
       if [ -f "$f" ]; then
@@ -478,7 +577,7 @@ for i in $(seq 0 $((total - 1))); do
 
   # Build canonical URL for --url flag
   canonical_url="$url"
-  if [ "$SHOW_URL" -eq 1 ] && [ -n "$video_id" ]; then
+  if [ "$eff_show_url" -eq 1 ] && [ -n "$video_id" ]; then
     case "$url" in
       *"youtube.com"*|*"youtu.be"*)
         canonical_url="https://www.youtube.com/watch?v=$video_id"
@@ -493,6 +592,9 @@ for i in $(seq 0 $((total - 1))); do
   result_descs+=("$video_desc")
   result_texts+=("$transcript")
   result_urls+=("$canonical_url")
+  result_eff_no_desc+=("$eff_no_desc")
+  result_eff_no_channel+=("$eff_no_channel")
+  result_eff_show_url+=("$eff_show_url")
   success_count=$((success_count + 1))
 
   log "[$idx/$total] Done: \"$video_title\""
@@ -521,13 +623,13 @@ build_t_element() {
   local attrs="title=\"$title_escaped\" id=\"$id_escaped\""
 
   # Channel attribute (unless --no-channel or empty)
-  if [ "$NO_CHANNEL" -eq 0 ] && [ -n "${result_channels[$idx]}" ]; then
+  if [ "${result_eff_no_channel[$idx]}" -eq 0 ] && [ -n "${result_channels[$idx]}" ]; then
     channel_escaped="$(xml_escape_attr "${result_channels[$idx]}")"
     attrs="$attrs channel=\"$channel_escaped\""
   fi
 
   # URL attribute (only if --url)
-  if [ "$SHOW_URL" -eq 1 ]; then
+  if [ "${result_eff_show_url[$idx]}" -eq 1 ]; then
     url_escaped="$(xml_escape_attr "${result_urls[$idx]}")"
     attrs="$attrs url=\"$url_escaped\""
   fi
@@ -535,7 +637,7 @@ build_t_element() {
   printf '<t %s>' "$attrs"
 
   # Description element (unless --no-desc or empty)
-  if [ "$NO_DESC" -eq 0 ] && [ -n "${result_descs[$idx]}" ]; then
+  if [ "${result_eff_no_desc[$idx]}" -eq 0 ] && [ -n "${result_descs[$idx]}" ]; then
     desc_escaped="$(xml_escape "${result_descs[$idx]}")"
     printf '\n<d>%s</d>' "$desc_escaped"
   fi
