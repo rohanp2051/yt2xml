@@ -75,9 +75,9 @@ check_deps() {
   local ytdlp_version
   ytdlp_version="$(yt-dlp --version 2>/dev/null)" || die "Failed to get yt-dlp version"
 
-  local min_version="2021.06.09"
+  local min_version="2022.02.04"
   if [ "$ytdlp_version" \< "$min_version" ]; then
-    die "yt-dlp version $ytdlp_version is too old. Minimum required: $min_version (for --print support). Update: yt-dlp -U"
+    die "yt-dlp version $ytdlp_version is too old. Minimum required: $min_version (for --print-to-file support). Update: yt-dlp -U"
   fi
 }
 
@@ -323,7 +323,7 @@ for i in $(seq 0 $((total - 1))); do
       --write-description \
       -o "$tmpdir/%(id)s" \
       "$url" \
-      >/dev/null 2>&2 || ytdlp_rc=$?
+      >/dev/null || ytdlp_rc=$?
   else
     yt-dlp \
       --write-subs --write-auto-subs \
