@@ -1,0 +1,7 @@
+*.vtt
+*.srt
+*.xml
+*.description
+.claude/
+.flow/
+scripts/

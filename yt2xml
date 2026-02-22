@@ -1,0 +1,587 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+###############################################################################
+# yt2xml — Fetch video transcripts via yt-dlp, output clean XML
+###############################################################################
+
+PROGNAME="yt2xml"
+VERSION="0.1.0"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+die() { printf '%s: error: %s\n' "$PROGNAME" "$1" >&2; exit "${2:-1}"; }
+warn() { printf '%s: warning: %s\n' "$PROGNAME" "$1" >&2; }
+log() { printf '%s\n' "$1" >&2; }
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: yt2xml [OPTIONS] URL [URL...]
+
+Fetch video transcripts via yt-dlp and output clean XML.
+
+Options:
+  -o, --output FILE   Write XML to FILE (atomic write)
+  -v, --verbose       Show full yt-dlp output on stderr
+  -h, --help          Show this help message
+      --version       Print version
+  -l, --lang CODES    Comma-separated subtitle language codes (default: en)
+      --no-desc       Omit <d> description element
+      --no-channel    Omit channel attribute
+      --url           Include url attribute in <t> elements
+
+Arguments:
+  URL                 One or more video URLs (any yt-dlp supported site)
+
+Examples:
+  yt2xml "https://youtu.be/dQw4w9WgXcQ"
+  yt2xml -o context.xml "https://youtu.be/vid1" "https://youtu.be/vid2"
+  yt2xml --lang es,en --no-desc "https://youtu.be/vid1"
+EOF
+}
+
+# xml_escape: escape text for XML content
+# Usage: xml_escape "string"
+xml_escape() {
+  local s="$1"
+  s="${s//&/&amp;}"
+  s="${s//</&lt;}"
+  s="${s//>/&gt;}"
+  printf '%s' "$s"
+}
+
+# xml_escape_attr: escape text for XML attribute values (includes quotes)
+# Usage: xml_escape_attr "string"
+xml_escape_attr() {
+  local s="$1"
+  s="${s//&/&amp;}"
+  s="${s//</&lt;}"
+  s="${s//>/&gt;}"
+  s="${s//\"/&quot;}"
+  printf '%s' "$s"
+}
+
+# ---------------------------------------------------------------------------
+# Dependency check
+# ---------------------------------------------------------------------------
+
+check_deps() {
+  if ! command -v yt-dlp >/dev/null 2>&1; then
+    die "yt-dlp is required but not found. Install it: https://github.com/yt-dlp/yt-dlp#installation"
+  fi
+
+  local ytdlp_version
+  ytdlp_version="$(yt-dlp --version 2>/dev/null)" || die "Failed to get yt-dlp version"
+
+  local min_version="2021.06.09"
+  if [ "$ytdlp_version" \< "$min_version" ]; then
+    die "yt-dlp version $ytdlp_version is too old. Minimum required: $min_version (for --print support). Update: yt-dlp -U"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# VTT/SRT cleaning function (single AWK invocation)
+# ---------------------------------------------------------------------------
+
+clean_subtitles() {
+  local subfile="$1"
+  awk '
+  BEGIN {
+    is_vtt = 0
+    is_auto = 0
+    in_note = 0
+    in_style = 0
+    prev = ""
+    header_done = 0
+  }
+
+  # Strip BOM
+  NR == 1 { gsub(/^\xef\xbb\xbf/, "") }
+
+  # Detect format from content
+  NR == 1 && /^WEBVTT/ {
+    is_vtt = 1
+    next
+  }
+
+  # VTT metadata lines after WEBVTT header
+  is_vtt && !header_done && /^(Kind:|Language:)/ { next }
+  is_vtt && !header_done && /^$/ { header_done = 1; next }
+
+  # NOTE blocks (VTT)
+  /^NOTE/ { in_note = 1; next }
+  in_note && /^$/ { in_note = 0; next }
+  in_note { next }
+
+  # STYLE blocks (VTT)
+  /^STYLE/ { in_style = 1; next }
+  in_style && /^$/ { in_style = 0; next }
+  in_style { next }
+
+  # Skip blank lines
+  /^[[:space:]]*$/ { next }
+
+  # Skip SRT sequence numbers (bare integers)
+  /^[0-9]+[[:space:]]*$/ { next }
+
+  # Skip timestamp lines (VTT: 00:00:01.000 --> 00:00:02.000 or SRT: 00:00:01,000 --> 00:00:02,000)
+  /[0-9][0-9]:[0-9][0-9][\.,][0-9]+ *--> *[0-9]/ { next }
+
+  # Detect auto-generated subs (presence of <c> tags or inline timestamps)
+  /<c[. ]/ || /<[0-9][0-9]:[0-9][0-9]/ { is_auto = 1 }
+
+  {
+    line = $0
+
+    # Strip positioning metadata (align:start position:0% etc.)
+    gsub(/align:[a-z]+/, "", line)
+    gsub(/position:[0-9]+%/, "", line)
+    gsub(/size:[0-9]+%/, "", line)
+    gsub(/line:[0-9]+%/, "", line)
+
+    # Remove ALL HTML/VTT tags
+    gsub(/<[^>]*>/, "", line)
+
+    # Decode HTML entities (amp LAST)
+    gsub(/&lt;/, "<", line)
+    gsub(/&gt;/, ">", line)
+    gsub(/&quot;/, "\"", line)
+    gsub(/&#39;/, "\047", line)
+    gsub(/&apos;/, "\047", line)
+    gsub(/&amp;/, "\\&", line)
+
+    # Trim leading/trailing whitespace
+    gsub(/^[[:space:]]+/, "", line)
+    gsub(/[[:space:]]+$/, "", line)
+
+    # Skip empty lines after cleaning
+    if (line == "") next
+
+    # Deduplicate consecutive identical lines
+    if (line == prev) next
+    prev = line
+
+    print line
+  }
+  ' "$subfile"
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+OUTPUT_FILE=""
+VERBOSE=0
+LANG_CODES="en"
+NO_DESC=0
+NO_CHANNEL=0
+SHOW_URL=0
+URLS=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|--output)
+      [ $# -ge 2 ] || die "Option $1 requires an argument"
+      OUTPUT_FILE="$2"
+      shift 2
+      ;;
+    -v|--verbose)
+      VERBOSE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --version)
+      printf '%s %s\n' "$PROGNAME" "$VERSION"
+      exit 0
+      ;;
+    -l|--lang)
+      [ $# -ge 2 ] || die "Option $1 requires an argument"
+      LANG_CODES="$2"
+      shift 2
+      ;;
+    --no-desc)
+      NO_DESC=1
+      shift
+      ;;
+    --no-channel)
+      NO_CHANNEL=1
+      shift
+      ;;
+    --url)
+      SHOW_URL=1
+      shift
+      ;;
+    --)
+      shift
+      # Remaining args are URLs
+      while [ $# -gt 0 ]; do
+        URLS+=("$1")
+        shift
+      done
+      ;;
+    -*)
+      die "Unknown option: $1. Use --help for usage."
+      ;;
+    *)
+      URLS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# Validate: at least one URL required
+if [ ${#URLS[@]} -eq 0 ]; then
+  usage
+  exit 1
+fi
+
+# Validate --lang format: comma-separated 2-3 char codes
+if ! printf '%s' "$LANG_CODES" | grep -qE '^[a-zA-Z-]{2,}(,[a-zA-Z-]{2,})*$'; then
+  die "Invalid --lang format: '$LANG_CODES'. Expected comma-separated language codes (e.g., en,es,fr)"
+fi
+
+# ---------------------------------------------------------------------------
+# Dependency check (after arg parsing so --help/--version work without yt-dlp)
+# ---------------------------------------------------------------------------
+
+check_deps
+
+# ---------------------------------------------------------------------------
+# URL deduplication
+# ---------------------------------------------------------------------------
+
+UNIQUE_URLS=()
+SEEN_URLS=""
+
+for url in "${URLS[@]}"; do
+  # Simple dedup check using a delimited string (Bash 3.2 compatible)
+  case "$SEEN_URLS" in
+    *"|$url|"*)
+      warn "Duplicate URL skipped: $url"
+      ;;
+    *)
+      SEEN_URLS="${SEEN_URLS}|${url}|"
+      UNIQUE_URLS+=("$url")
+      ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# Temp directory with cleanup trap
+# ---------------------------------------------------------------------------
+
+tmpdir="$(mktemp -d)" || die "Failed to create temp directory"
+trap 'rm -rf -- "$tmpdir"' EXIT
+
+# ---------------------------------------------------------------------------
+# Per-video processing
+# ---------------------------------------------------------------------------
+
+total=${#UNIQUE_URLS[@]}
+success_count=0
+fail_count=0
+
+# Result storage arrays (Bash 3.2 compatible — indexed arrays)
+result_titles=()
+result_ids=()
+result_channels=()
+result_descs=()
+result_texts=()
+result_urls=()
+fail_urls=()
+fail_reasons=()
+
+for i in $(seq 0 $((total - 1))); do
+  url="${UNIQUE_URLS[$i]}"
+  idx=$((i + 1))
+
+  log "[$idx/$total] Fetching $url..."
+
+  # Clean tmpdir between iterations
+  if [ "$i" -gt 0 ]; then
+    rm -f "$tmpdir"/*
+  fi
+
+  # Run yt-dlp (use --print-to-file for metadata since --print suppresses file writes)
+  ytdlp_stderr_file="$tmpdir/ytdlp_stderr.txt"
+
+  ytdlp_rc=0
+  if [ "$VERBOSE" -eq 1 ]; then
+    yt-dlp \
+      --write-subs --write-auto-subs \
+      --sub-lang "$LANG_CODES" \
+      --sub-format "vtt" \
+      --skip-download \
+      --no-playlist \
+      --print-to-file title "$tmpdir/%(id)s.title" \
+      --print-to-file channel "$tmpdir/%(id)s.channel" \
+      --write-description \
+      -o "$tmpdir/%(id)s" \
+      "$url" \
+      >/dev/null 2>&2 || ytdlp_rc=$?
+  else
+    yt-dlp \
+      --write-subs --write-auto-subs \
+      --sub-lang "$LANG_CODES" \
+      --sub-format "vtt" \
+      --skip-download \
+      --no-playlist \
+      --print-to-file title "$tmpdir/%(id)s.title" \
+      --print-to-file channel "$tmpdir/%(id)s.channel" \
+      --write-description \
+      -o "$tmpdir/%(id)s" \
+      "$url" \
+      >/dev/null 2>"$ytdlp_stderr_file" || ytdlp_rc=$?
+  fi
+
+  # Filter yt-dlp stderr in non-verbose mode
+  if [ "$VERBOSE" -eq 0 ] && [ -f "$ytdlp_stderr_file" ]; then
+    grep -iE 'ERROR|WARNING' "$ytdlp_stderr_file" >&2 2>/dev/null || true
+  fi
+
+  # Check for yt-dlp failure
+  if [ "$ytdlp_rc" -ne 0 ]; then
+    log "[$idx/$total] Failed: $url"
+    fail_count=$((fail_count + 1))
+    fail_urls+=("$url")
+    fail_reasons+=("yt-dlp exited with code $ytdlp_rc")
+    continue
+  fi
+
+  # Extract video ID from files in tmpdir
+  video_id=""
+  for f in "$tmpdir"/*; do
+    fname="$(basename "$f")"
+    case "$fname" in
+      ytdlp_stderr.txt) continue ;;
+      *.title)
+        # Extract ID: everything before .title
+        video_id="${fname%.title}"
+        break
+        ;;
+      *.vtt|*.srt|*.description|*.channel)
+        # Extract ID: everything before first dot
+        video_id="${fname%%.*}"
+        break
+        ;;
+    esac
+  done
+
+  # Read title and channel from print-to-file outputs
+  video_title=""
+  video_channel=""
+  for f in "$tmpdir"/*.title; do
+    if [ -f "$f" ]; then
+      video_title="$(head -1 "$f")"
+      break
+    fi
+  done
+  for f in "$tmpdir"/*.channel; do
+    if [ -f "$f" ]; then
+      video_channel="$(head -1 "$f")"
+      break
+    fi
+  done
+
+  if [ -z "$video_title" ]; then
+    video_title="Unknown"
+  fi
+
+  if [ -z "$video_id" ]; then
+    # Try to extract from URL
+    case "$url" in
+      *"youtube.com/watch?v="*)
+        video_id="${url#*v=}"
+        video_id="${video_id%%&*}"
+        ;;
+      *"youtu.be/"*)
+        video_id="${url#*youtu.be/}"
+        video_id="${video_id%%\?*}"
+        video_id="${video_id%%&*}"
+        ;;
+    esac
+  fi
+
+  # Read description if available
+  video_desc=""
+  if [ "$NO_DESC" -eq 0 ]; then
+    desc_file=""
+    for f in "$tmpdir"/*.description; do
+      if [ -f "$f" ]; then
+        desc_file="$f"
+        break
+      fi
+    done
+    if [ -n "$desc_file" ]; then
+      # Collapse multi-line description to single paragraph
+      video_desc="$(awk '
+        NF { gsub(/^[[:space:]]+/, ""); gsub(/[[:space:]]+$/, ""); if (length > 0) { if (out) out = out " "; out = out $0 } }
+        END { print out }
+      ' "$desc_file")"
+    fi
+  fi
+
+  # Find subtitle file: prefer VTT, fallback to SRT
+  sub_file=""
+  for f in "$tmpdir"/*.vtt; do
+    if [ -f "$f" ]; then
+      sub_file="$f"
+      break
+    fi
+  done
+  if [ -z "$sub_file" ]; then
+    for f in "$tmpdir"/*.srt; do
+      if [ -f "$f" ]; then
+        sub_file="$f"
+        break
+      fi
+    done
+  fi
+
+  if [ -z "$sub_file" ]; then
+    log "[$idx/$total] Failed: $url (no subtitles found)"
+    log "  Hint: try 'yt-dlp --list-subs $url' to see available subtitles"
+    fail_count=$((fail_count + 1))
+    fail_urls+=("$url")
+    fail_reasons+=("no subtitles available")
+    continue
+  fi
+
+  # Clean subtitles
+  cleaned_text="$(clean_subtitles "$sub_file")"
+
+  # Join into single paragraph
+  transcript="$(printf '%s' "$cleaned_text" | awk '
+    NF {
+      gsub(/^[[:space:]]+/, "")
+      gsub(/[[:space:]]+$/, "")
+      if (length > 0) {
+        if (out) out = out " "
+        out = out $0
+      }
+    }
+    END { print out }
+  ')"
+
+  if [ -z "$transcript" ]; then
+    log "[$idx/$total] Failed: $url (empty transcript after cleaning)"
+    fail_count=$((fail_count + 1))
+    fail_urls+=("$url")
+    fail_reasons+=("empty transcript after cleaning")
+    continue
+  fi
+
+  # Build canonical URL for --url flag
+  canonical_url="$url"
+  if [ "$SHOW_URL" -eq 1 ] && [ -n "$video_id" ]; then
+    case "$url" in
+      *"youtube.com"*|*"youtu.be"*)
+        canonical_url="https://www.youtube.com/watch?v=$video_id"
+        ;;
+    esac
+  fi
+
+  # Store results
+  result_titles+=("$video_title")
+  result_ids+=("$video_id")
+  result_channels+=("$video_channel")
+  result_descs+=("$video_desc")
+  result_texts+=("$transcript")
+  result_urls+=("$canonical_url")
+  success_count=$((success_count + 1))
+
+  log "[$idx/$total] Done: \"$video_title\""
+done
+
+# ---------------------------------------------------------------------------
+# XML assembly
+# ---------------------------------------------------------------------------
+
+if [ "$success_count" -eq 0 ]; then
+  die "All $total video(s) failed. No XML output." 1
+fi
+
+build_t_element() {
+  local idx="$1"
+  local title_escaped
+  local id_escaped
+  local channel_escaped
+  local url_escaped
+  local desc_escaped
+  local text_escaped
+
+  title_escaped="$(xml_escape_attr "${result_titles[$idx]}")"
+  id_escaped="$(xml_escape_attr "${result_ids[$idx]}")"
+
+  local attrs="title=\"$title_escaped\" id=\"$id_escaped\""
+
+  # Channel attribute (unless --no-channel or empty)
+  if [ "$NO_CHANNEL" -eq 0 ] && [ -n "${result_channels[$idx]}" ]; then
+    channel_escaped="$(xml_escape_attr "${result_channels[$idx]}")"
+    attrs="$attrs channel=\"$channel_escaped\""
+  fi
+
+  # URL attribute (only if --url)
+  if [ "$SHOW_URL" -eq 1 ]; then
+    url_escaped="$(xml_escape_attr "${result_urls[$idx]}")"
+    attrs="$attrs url=\"$url_escaped\""
+  fi
+
+  printf '<t %s>' "$attrs"
+
+  # Description element (unless --no-desc or empty)
+  if [ "$NO_DESC" -eq 0 ] && [ -n "${result_descs[$idx]}" ]; then
+    desc_escaped="$(xml_escape "${result_descs[$idx]}")"
+    printf '\n<d>%s</d>' "$desc_escaped"
+  fi
+
+  # Transcript text
+  text_escaped="$(xml_escape "${result_texts[$idx]}")"
+  printf '\n%s' "$text_escaped"
+
+  printf '\n</t>'
+}
+
+xml_output=""
+
+if [ "$total" -eq 1 ] && [ "$success_count" -eq 1 ]; then
+  # Single URL, single success: no wrapper
+  xml_output="$(build_t_element 0)"
+else
+  # Multiple videos: wrap in <ts>
+  xml_output="<ts>"
+  for j in $(seq 0 $((success_count - 1))); do
+    xml_output="$xml_output
+$(build_t_element "$j")"
+  done
+  # Add failure comments
+  for j in $(seq 0 $((fail_count - 1))); do
+    fail_url_escaped="$(xml_escape "${fail_urls[$j]}")"
+    fail_reason_escaped="$(xml_escape "${fail_reasons[$j]}")"
+    xml_output="$xml_output
+<!-- Failed: $fail_url_escaped - $fail_reason_escaped -->"
+  done
+  xml_output="$xml_output
+</ts>"
+fi
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+if [ -n "$OUTPUT_FILE" ]; then
+  # Atomic write: temp file + mv
+  out_tmp="$(mktemp)" || die "Failed to create temp file for output"
+  printf '%s\n' "$xml_output" > "$out_tmp"
+  mv -f "$out_tmp" "$OUTPUT_FILE"
+  log "Written to $OUTPUT_FILE"
+else
+  printf '%s\n' "$xml_output"
+fi
+
+exit 0
